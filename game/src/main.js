@@ -1,134 +1,204 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
+// Tideline Harbour — boot and wiring.
+// One clear job: connect the pieces — create the game state, hook up
+// input and the toolbar, run the clock and the render loop, and set up
+// the deterministic screenshot states (?shot=title|cover|dusk|complete).
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+import { HINT_PULSE_MS, TIME_BONUS_PER_FIND, MISS_PENALTY_SECONDS, FIND_POINTS, HINT_COST, SHAKE_MS } from './config.js';
+import { SCENES } from './differences.js';
+import { createGame, currentScene, startScene, completeScene, nextScene, restartGame } from './game-state.js';
+import { attachInput, panelAt, hitTest } from './input.js';
+import { drawGame, overlayButtons } from './render.js';
+import { unlockAudio, playFound, playMiss, playClick, playComplete, toggleMute, setAudioEnabled } from './audio.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const ctx = canvas.getContext('2d');
+const game = createGame();
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+// Score snapshot at the start of the current scene, so restarting a
+// scene does not let a player farm points by replaying it.
+let scoreAtSceneStart = 0;
+
+function beginScene(index) {
+  scoreAtSceneStart = game.score;
+  startScene(game, index);
+}
+
+function restartScene() {
+  game.score = scoreAtSceneStart;
+  startScene(game, game.sceneIndex);
+}
+
+// ---------- actions ----------
+
+function doHint(now) {
+  if (game.screen !== 'playing' || game.hintsLeft <= 0) return;
+  const scene = currentScene(game);
+  const unfound = scene.differences.filter((d) => !game.found.has(d.id));
+  if (unfound.length === 0) return;
+  const target = unfound[Math.floor(Math.random() * unfound.length)];
+  game.hintsLeft -= 1;
+  game.score = Math.max(0, game.score - HINT_COST);
+  game.hint = { diffId: target.id, start: now, until: now + HINT_PULSE_MS };
+  playClick();
+}
+
+function doButton(id, now) {
+  playClick();
+  if (id === 'start') {
+    game.score = 0;
+    game.sceneScores = [];
+    game.sceneStars = [];
+    beginScene(0);
+  } else if (id === 'resume') {
+    game.screen = 'playing';
+  } else if (id === 'restart' || id === 'retry') {
+    restartScene();
+  } else if (id === 'next') {
+    beginScene(game.sceneIndex + 1);
+  } else if (id === 'again') {
+    game.score = 0;
+    game.sceneScores = [];
+    game.sceneStars = [];
+    beginScene(0);
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
+function onCanvasPoint(x, y, now) {
+  unlockAudio();
+  for (const btn of overlayButtons(game)) {
+    if (x >= btn.x && x <= btn.x + btn.w && y >= btn.y && y <= btn.y + btn.h) {
+      doButton(btn.id, now);
       return;
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
   }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
+  if (game.screen !== 'playing') return;
+  const hit = panelAt(x, y);
+  if (!hit) return;
+  const scene = currentScene(game);
+  const diff = hitTest(scene, game.found, hit.x, hit.y);
+  if (diff) {
+    game.found.add(diff.id);
+    game.markers.set(diff.id, now);
+    game.score += FIND_POINTS;
+    game.timeLeft = Math.min(scene.timeLimit, game.timeLeft + TIME_BONUS_PER_FIND);
+    if (game.hint && game.hint.diffId === diff.id) game.hint = null;
+    playFound();
+    if (game.found.size === scene.differences.length) {
+      completeScene(game);
+      playComplete();
     }
-    renderer.draw(world.state, screen, best);
+  } else {
+    game.timeLeft -= MISS_PENALTY_SECONDS;
+    game.ripples.push({ x: hit.x, y: hit.y, panel: hit.panel, t: now });
+    game.shakeUntil = now + SHAKE_MS;
+    playMiss();
+    if (game.timeLeft <= 0) {
+      game.timeLeft = 0;
+      game.screen = 'timeUp';
+    }
   }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
-  requestAnimationFrame(frame);
 }
 
-if (shot) runShot(shot);
-else runGame();
+function onKey(action, now) {
+  unlockAudio();
+  if (action === 'hint') doHint(now);
+  else if (action === 'pause') {
+    if (game.screen === 'playing') game.screen = 'paused';
+    else if (game.screen === 'paused') game.screen = 'playing';
+  } else if (action === 'mute') {
+    updateMuteButton(toggleMute());
+  } else if (action === 'restart') {
+    if (game.screen === 'playing' || game.screen === 'paused' || game.screen === 'timeUp') restartScene();
+  } else if (action === 'confirm') {
+    const buttons = overlayButtons(game);
+    if (buttons.length > 0) doButton(buttons[0].id, now);
+  }
+}
+
+// ---------- toolbar (DOM buttons mirror the keys) ----------
+
+const muteButton = document.getElementById('btn-mute');
+function updateMuteButton(muted) {
+  if (muteButton) muteButton.textContent = muted ? 'Unmute (M)' : 'Mute (M)';
+}
+document.getElementById('btn-hint')?.addEventListener('click', () => { unlockAudio(); doHint(performance.now()); });
+document.getElementById('btn-pause')?.addEventListener('click', () => { unlockAudio(); onKey('pause', performance.now()); });
+document.getElementById('btn-restart')?.addEventListener('click', () => { unlockAudio(); onKey('restart', performance.now()); });
+muteButton?.addEventListener('click', () => { unlockAudio(); updateMuteButton(toggleMute()); });
+
+// ---------- screenshot states ----------
+
+const SHOT_NOW = 1000; // frozen clock for screenshots: markers fully bloomed
+
+function setupShot(shot) {
+  game.shotMode = true;
+  setAudioEnabled(false);
+  if (shot === 'cover') {
+    // Scene 2, mid-play: five found, four to go, ~60% of the tide left.
+    startScene(game, 1);
+    const scene = currentScene(game);
+    for (const diff of scene.differences.slice(0, 5)) {
+      game.found.add(diff.id);
+      game.markers.set(diff.id, 0);
+    }
+    game.score = 500;
+    game.timeLeft = scene.timeLimit * 0.6;
+  } else if (shot === 'dusk') {
+    // Scene 3, mid-play: five found, seven to go, a hint ring showing,
+    // ~45% of the tide left.
+    startScene(game, 2);
+    const scene = currentScene(game);
+    for (const diff of scene.differences.slice(0, 5)) {
+      game.found.add(diff.id);
+      game.markers.set(diff.id, 0);
+    }
+    game.score = 1650;
+    game.timeLeft = scene.timeLimit * 0.45;
+    game.hintsLeft = 2;
+    const target = scene.differences[5];
+    game.hint = { diffId: target.id, start: SHOT_NOW - 135, until: SHOT_NOW + 1000 };
+  } else if (shot === 'complete') {
+    startScene(game, 2);
+    const scene = currentScene(game);
+    for (const diff of scene.differences) {
+      game.found.add(diff.id);
+      game.markers.set(diff.id, 0);
+    }
+    game.sceneScores = [1080, 940, 630];
+    game.sceneStars = [3, 2, 3];
+    game.score = 2650;
+    game.screen = 'gameComplete';
+  } else {
+    game.screen = 'title';
+  }
+}
+
+// ---------- boot and loop ----------
+
+const shot = new URLSearchParams(window.location.search).get('shot');
+if (shot) setupShot(shot);
+
+attachInput(canvas, {
+  onCanvasPoint: (x, y) => onCanvasPoint(x, y, performance.now()),
+  onKey: (action) => onKey(action, performance.now()),
+});
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (!game.shotMode) {
+    if (game.screen === 'playing') {
+      game.timeLeft -= dt;
+      if (game.timeLeft <= 0) {
+        game.timeLeft = 0;
+        game.screen = 'timeUp';
+      }
+    }
+    drawGame(ctx, game, now);
+  } else {
+    drawGame(ctx, game, SHOT_NOW);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
